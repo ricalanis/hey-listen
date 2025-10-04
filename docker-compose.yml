@@ -11,7 +11,12 @@ services:
     restart: unless-stopped
 
     environment:
-      - SENSO_API_KEY=${SENSO_API_KEY}
+      - PINECONE_API_KEY=${PINECONE_API_KEY}
+      - PINECONE_ENVIRONMENT=${PINECONE_ENVIRONMENT}
+      - PINECONE_INDEX_NAME=${PINECONE_INDEX_NAME:-hey-listen-transcriptions}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+      - VECTOR_DIMENSION=${VECTOR_DIMENSION:-384}
+      - MAX_RECORDS=${MAX_RECORDS:-1000}
       - WHISPER_MODEL=${WHISPER_MODEL:-tiny}
       - CHUNK_DURATION=${CHUNK_DURATION:-5}
       - SAMPLE_RATE=${SAMPLE_RATE:-16000}

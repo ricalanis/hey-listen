@@ -1,6 +1,6 @@
 """
 Audio Worker for Hey Listen
-Captures audio, transcribes with Whisper, and ingests to Senso.ai
+Captures audio, transcribes with Whisper, and stores metadata in Pinecone
 """
 
 import os
@@ -8,12 +8,11 @@ import time
 import logging
 
 import numpy as np
-import requests
 import sounddevice as sd
 import whisper
 from typing import Optional
 from dotenv import load_dotenv
-from tenacity import retry, stop_after_attempt, wait_exponential
+from pinecone_manager import PineconeManager
 
 # Configure logging
 logging.basicConfig(
@@ -28,7 +27,7 @@ logging.basicConfig(
 
 class AudioWorker:
     """
-    Continuous audio transcription worker with Senso.ai integration.
+    Continuous audio transcription worker with Pinecone integration.
     """
 
     def __init__(
@@ -41,10 +40,16 @@ class AudioWorker:
         # Load environment variables
         load_dotenv()
 
-        # API Configuration
-        self.api_key = os.getenv('SENSO_API_KEY')
-        if not self.api_key:
-            logging.warning("SENSO_API_KEY not set in .env file.")
+        # Pinecone configuration
+        self.pinecone_manager: Optional[PineconeManager] = None
+        if os.getenv('PINECONE_API_KEY'):
+            try:
+                self.pinecone_manager = PineconeManager()
+                logging.info("Pinecone initialized")
+            except Exception as e:
+                logging.error(f"Pinecone initialization failed: {e}")
+        else:
+            logging.warning("PINECONE_API_KEY not set in .env file. Pinecone disabled.")
 
         # Audio Configuration
         self.sample_rate = sample_rate or int(os.getenv('SAMPLE_RATE', 16000))
@@ -126,77 +131,7 @@ class AudioWorker:
         # Placeholder: Always return Speaker A
         return "A"
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10)
-    )
-    def ingest_to_senso(self, text: str, speaker: str, timestamp: float) -> Optional[str]:
-        """
-        Ingest transcription to Senso.ai knowledge base.
-
-        Args:
-            text (str): Transcribed text
-            speaker (str): Speaker identifier
-            timestamp (float): Unix timestamp
-
-        Returns:
-            str | None: Content ID if successful, None otherwise
-        """
-        # Validate API key
-        if not self.api_key:
-            logging.error("Cannot ingest: SENSO_API_KEY not set")
-            return None
-
-        # Skip empty transcriptions
-        if not text or not text.strip():
-            logging.debug("Skipping empty transcription")
-            return None
-
-        # Format timestamp for human readability
-        time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))
-
-        payload = {
-            "title": f"Transcription - Speaker {speaker} at {time_str}",
-            "summary": f"Transcript from {speaker}: {text[:100]}...",
-            "text": f"**Speaker {speaker}:** {text}\n\n*Timestamp: {timestamp}*",
-        }
-
-        try:
-            response = requests.post(
-                "https://sdk.senso.ai/api/v1/content/raw",
-                headers={
-                    "X-API-Key": self.api_key or "",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=10,
-            )
-            response.raise_for_status()
-
-            data = response.json()
-            content_id = data.get("id")
-            status = data.get("processing_status", "unknown")
-
-            logging.info(f"\u2713 Ingested to Senso: {content_id} (Status: {status})")
-            time.sleep(2)
-
-            return content_id
-
-        except requests.exceptions.HTTPError as e:
-            try:
-                status_code = e.response.status_code if e.response is not None else 'N/A'
-                body = e.response.text if e.response is not None else ''
-            except Exception:
-                status_code = 'N/A'
-                body = ''
-            logging.error(f"\u2717 HTTP Error during ingest: {status_code} - {body}")
-            return None
-        except requests.exceptions.RequestException as e:
-            logging.error(f"\u2717 Network error during ingest: {e}")
-            return None
-        except Exception as e:
-            logging.error(f"\u2717 Unexpected error during ingest: {e}")
-            return None
+    # Senso ingestion removed. Pinecone storage is handled asynchronously in run().
 
     def run(self) -> None:
         """Main loop: continuously capture, transcribe, and ingest audio."""
@@ -205,13 +140,11 @@ class AudioWorker:
         logging.info(f"Model: {os.getenv('WHISPER_MODEL', 'tiny')}")
         logging.info(f"Chunk Duration: {self.chunk_duration}s")
         logging.info(f"Sample Rate: {self.sample_rate}Hz")
-        logging.info(f"API Key Set: {'Yes' if self.api_key else 'No'}")
+        logging.info(f"Pinecone Enabled: {'Yes' if self.pinecone_manager else 'No'}")
         logging.info("=" * 60)
 
-        if not self.api_key:
-            logging.warning(
-                "Running in LOCAL MODE (no Senso.ai ingestion). Set SENSO_API_KEY in .env to enable cloud storage."
-            )
+        if not self.pinecone_manager:
+            logging.warning("Running without Pinecone storage (set PINECONE_API_KEY to enable)")
 
         logging.info("Listening... Press Ctrl+C to stop")
 
@@ -231,10 +164,19 @@ class AudioWorker:
                 speaker = self.diarize(audio)
 
                 timestamp = time.time()
-                content_id = self.ingest_to_senso(text, speaker, timestamp) if self.api_key else None
 
-                if content_id:
-                    logging.info(f"[{speaker}] {text[:60]}... → {content_id}")
+                # Schedule async storage to Pinecone (non-blocking)
+                if self.pinecone_manager:
+                    future = self.pinecone_manager.store_transcription_async(text, speaker, timestamp)
+                    status = self.pinecone_manager.check_storage_status(future)
+                    if status == "pending":
+                        logging.info(f"[{speaker}] {text[:60]}... → Pinecone: pending")
+                    elif status == "success":
+                        logging.info(f"[{speaker}] {text[:60]}... → Pinecone: ✓")
+                    elif status in ("failed", "error"):
+                        logging.warning(f"[{speaker}] {text[:60]}... → Pinecone: ✗")
+                    else:
+                        logging.info(f"[{speaker}] {text[:60]}... → Pinecone: {status}")
                 else:
                     logging.info(f"[{speaker}] {text[:60]}... → LOCAL ONLY")
 
