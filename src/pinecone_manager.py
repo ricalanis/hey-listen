@@ -3,6 +3,7 @@ import time
 import logging
 import concurrent.futures
 from typing import Any, Dict, List, Optional, Tuple
+from dotenv import load_dotenv
 
 
 class PineconeManager:
@@ -18,6 +19,9 @@ class PineconeManager:
     """
 
     def __init__(self) -> None:
+        # Load environment variables from .env file
+        load_dotenv()
+        
         # Read environment configuration
         self.api_key: Optional[str] = os.getenv("PINECONE_API_KEY")
         self.environment: Optional[str] = os.getenv("PINECONE_ENVIRONMENT")
@@ -35,30 +39,29 @@ class PineconeManager:
 
         # Lazy imports
         try:
-            import pinecone  # type: ignore
+            from pinecone import Pinecone  # type: ignore
             from sentence_transformers import SentenceTransformer  # type: ignore
         except Exception as e:  # pragma: no cover - surfaced to callers
             raise RuntimeError(
                 "Missing dependencies for Pinecone. Install 'pinecone-client' and 'sentence-transformers'."
             ) from e
 
-        # Initialize clients
-        pinecone.init(api_key=self.api_key, environment=self.environment)
+        # Initialize Pinecone client
+        self.pc = Pinecone(api_key=self.api_key)
 
         # Create or get the index
-        existing = set(pinecone.list_indexes())
-        if self.index_name not in existing:
+        existing_indexes = [idx.name for idx in self.pc.list_indexes()]
+        if self.index_name not in existing_indexes:
             logging.info(
                 f"Creating Pinecone index '{self.index_name}' (dim={self.vector_dimension}, metric=cosine)"
             )
-            pinecone.create_index(
+            self.pc.create_index(
                 name=self.index_name,
                 dimension=self.vector_dimension,
                 metric="cosine",
             )
 
-        self._pinecone = pinecone
-        self.index = pinecone.Index(self.index_name)
+        self.index = self.pc.Index(self.index_name)
 
         # Load embedding model once
         self._embedding_model = SentenceTransformer(self.embedding_model_name)
