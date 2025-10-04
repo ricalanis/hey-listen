@@ -29,7 +29,7 @@ class PineconeManager:
         self.embedding_model_name: str = os.getenv(
             "EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
         )
-        self.vector_dimension: int = int(os.getenv("VECTOR_DIMENSION", 384))
+        self.vector_dimension: int = int(os.getenv("VECTOR_DIMENSION", 512))
         self.max_records: int = int(os.getenv("MAX_RECORDS", 1000))
 
         if not self.api_key or not self.environment:
