@@ -73,6 +73,12 @@ class PineconeManager:
     def generate_embedding(self, text: str) -> List[float]:
         """Generate embedding for a given text."""
         vector: List[float] = self._embedding_model.encode(text).tolist()
+        
+        # Truncate vector to match Pinecone index dimensions if necessary
+        if len(vector) > self.vector_dimension:
+            vector = vector[:self.vector_dimension]
+            logging.debug(f"Truncated embedding from {len(self._embedding_model.encode(text))} to {self.vector_dimension} dimensions")
+        
         return vector
 
     # ---- Async storage interface ----

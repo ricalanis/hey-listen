@@ -1,0 +1,2 @@
+eval_id,timestamp,context_id,json_valid,has_decision,should_speak_type_valid,reasoning_present,reasoning_len_ge_2_sentences,urgency_in_allowed_set,confidence_in_range,tool_calls_array_present,tool_calls_types_valid,response_text_present_when_should_speak_true,response_text_null_when_should_speak_false,tone_in_allowed_set_or_null,follow_up_needed_boolean,memory_update_present,memory_key_points_nonempty,memory_action_items_array_present,overall_comments
+example-1,,ctx-deployment,, , , , , , , , , , , , , , , ,
