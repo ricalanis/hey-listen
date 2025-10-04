@@ -94,6 +94,8 @@ This document outlines the implementation plan for integrating Pinecone vector d
 pinecone-client==2.2.4
 sentence-transformers==2.2.2
 openai==1.3.0  # Alternative embedding provider
+asyncio  # For async operations (built-in)
+concurrent.futures  # For thread pool execution (built-in)
 ```
 
 ### Environment Variables
@@ -143,41 +145,63 @@ Transcription Data → Pinecone (Vector + Metadata)
     └── model: "whisper-tiny"
 ```
 
-### 3. FIFO Storage Workflow
+### 3. Asynchronous FIFO Storage Workflow
 ```
-1. Generate embedding from transcription text
-2. Query Pinecone for oldest record (min timestamp)
-3. Delete oldest record if exists
-4. Upsert new record with current timestamp
-5. Log operation results
+1. Complete transcription processing (non-blocking)
+2. Schedule async task for Pinecone operations:
+   a. Generate embedding from transcription text
+   b. Query Pinecone for oldest record (min timestamp)
+   c. Delete oldest record if exists
+   d. Upsert new record with current timestamp
+   e. Log operation results
+3. Continue audio processing without waiting
 ```
 
 ## FIFO Storage Strategy
 
 ### Implementation Approach
 ```python
+import asyncio
+import concurrent.futures
+from typing import Optional
+
 class PineconeFIFO:
     def __init__(self, index, max_records=1000):
         self.index = index
         self.max_records = max_records
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
     
-    async def upsert_with_fifo(self, vector_id, vector, metadata):
-        # 1. Check if we need to evict
-        if await self._should_evict():
-            await self._evict_oldest()
-        
-        # 2. Upsert new record
-        await self.index.upsert([(vector_id, vector, metadata)])
+    def upsert_with_fifo_async(self, vector_id, vector, metadata):
+        """Schedule async Pinecone operations without blocking."""
+        # Schedule the operation in background thread
+        future = self.executor.submit(self._upsert_with_fifo_sync, vector_id, vector, metadata)
+        return future
     
-    async def _should_evict(self):
-        stats = await self.index.describe_index_stats()
+    def _upsert_with_fifo_sync(self, vector_id, vector, metadata):
+        """Synchronous version for thread execution."""
+        try:
+            # 1. Check if we need to evict
+            if self._should_evict():
+                self._evict_oldest()
+            
+            # 2. Upsert new record
+            self.index.upsert([(vector_id, vector, metadata)])
+            logging.info(f"✓ Pinecone upsert completed: {vector_id}")
+            return True
+        except Exception as e:
+            logging.error(f"✗ Pinecone upsert failed: {e}")
+            return False
+    
+    def _should_evict(self):
+        stats = self.index.describe_index_stats()
         return stats.total_vector_count >= self.max_records
     
-    async def _evict_oldest(self):
+    def _evict_oldest(self):
         # Query for oldest record
-        oldest = await self._find_oldest_record()
+        oldest = self._find_oldest_record()
         if oldest:
-            await self.index.delete([oldest.id])
+            self.index.delete([oldest.id])
+            logging.info(f"✓ Evicted oldest record: {oldest.id}")
 ```
 
 ### Metadata Schema
@@ -238,6 +262,8 @@ import pinecone
 from sentence_transformers import SentenceTransformer
 from typing import List, Dict, Any, Optional
 import logging
+import concurrent.futures
+import time
 
 class PineconeManager:
     def __init__(self):
@@ -255,6 +281,9 @@ class PineconeManager:
         
         # Get or create index
         self.index = self._get_or_create_index()
+        
+        # Thread pool for async operations
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
     
     def _get_or_create_index(self):
         if self.index_name not in pinecone.list_indexes():
@@ -269,43 +298,107 @@ class PineconeManager:
         """Generate embedding for text."""
         return self.embedding_model.encode(text).tolist()
     
-    def upsert_with_fifo(self, text: str, metadata: Dict[str, Any]) -> bool:
-        """Upsert record with FIFO eviction."""
-        # Implementation details in Step 7.3
-        pass
+    def upsert_transcription_async(self, text: str, speaker: str, timestamp: float):
+        """Schedule async transcription storage with FIFO eviction."""
+        # Schedule the operation in background thread
+        future = self.executor.submit(self._upsert_transcription_sync, text, speaker, timestamp)
+        return future
+    
+    def _upsert_transcription_sync(self, text: str, speaker: str, timestamp: float) -> bool:
+        """Synchronous version for thread execution."""
+        try:
+            # Generate embedding
+            vector = self.generate_embedding(text)
+            
+            # Prepare metadata
+            time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))
+            metadata = {
+                "text": text,
+                "speaker": speaker,
+                "timestamp": timestamp,
+                "created_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(timestamp)),
+                "title": f"Transcription - Speaker {speaker} at {time_str}",
+                "summary": f"Transcript from {speaker}: {text[:100]}...",
+                "chunk_duration": 5,
+                "sample_rate": 16000,
+                "model": "whisper-tiny"
+            }
+            
+            # Generate unique ID
+            vector_id = f"transcript_{int(timestamp)}_{speaker}"
+            
+            # Check if we need to evict
+            if self._should_evict():
+                self._evict_oldest()
+            
+            # Upsert new record
+            self.index.upsert([(vector_id, vector, metadata)])
+            logging.info(f"✓ Pinecone upsert completed: {vector_id}")
+            return True
+            
+        except Exception as e:
+            logging.error(f"✗ Pinecone upsert failed: {e}")
+            return False
+    
+    def _should_evict(self):
+        stats = self.index.describe_index_stats()
+        return stats.total_vector_count >= self.max_records
+    
+    def _evict_oldest(self):
+        # Query for oldest record
+        oldest = self._find_oldest_record()
+        if oldest:
+            self.index.delete([oldest.id])
+            logging.info(f"✓ Evicted oldest record: {oldest.id}")
+    
+    def _find_oldest_record(self) -> Optional[Dict]:
+        """Find the oldest record in the index."""
+        try:
+            # Query for records sorted by timestamp
+            query_response = self.index.query(
+                vector=[0.0] * 384,  # Dummy vector
+                top_k=1,
+                include_metadata=True,
+                filter={"timestamp": {"$gte": 0}},  # All records
+                sort_by="timestamp"
+            )
+            
+            if query_response.matches:
+                return query_response.matches[0]
+            return None
+            
+        except Exception as e:
+            logging.error(f"Failed to find oldest record: {e}")
+            return None
 ```
 
-#### 7.2.2: Basic Upsert Functionality
+#### 7.2.2: Async Storage Interface
 ```python
-def upsert_transcription(self, text: str, speaker: str, timestamp: float) -> bool:
-    """Store transcription in Pinecone with FIFO management."""
-    try:
-        # Generate embedding
-        vector = self.generate_embedding(text)
-        
-        # Prepare metadata
-        time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))
-        metadata = {
-            "text": text,
-            "speaker": speaker,
-            "timestamp": timestamp,
-            "created_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(timestamp)),
-            "title": f"Transcription - Speaker {speaker} at {time_str}",
-            "summary": f"Transcript from {speaker}: {text[:100]}...",
-            "chunk_duration": 5,  # From config
-            "sample_rate": 16000,  # From config
-            "model": "whisper-tiny"
-        }
-        
-        # Generate unique ID
-        vector_id = f"transcript_{int(timestamp)}_{speaker}"
-        
-        # Upsert with FIFO
-        return self.upsert_with_fifo(vector_id, vector, metadata)
-        
-    except Exception as e:
-        logging.error(f"Pinecone upsert failed: {e}")
-        return False
+def store_transcription_async(self, text: str, speaker: str, timestamp: float):
+    """Public interface for async transcription storage."""
+    if not text or not text.strip():
+        logging.debug("Skipping empty transcription")
+        return None
+    
+    # Schedule async operation
+    future = self.upsert_transcription_async(text, speaker, timestamp)
+    logging.debug(f"Scheduled async Pinecone storage for: {text[:30]}...")
+    return future
+
+def check_storage_status(self, future):
+    """Check if async storage operation completed."""
+    if future is None:
+        return "skipped"
+    
+    if future.done():
+        try:
+            success = future.result()
+            return "success" if success else "failed"
+        except Exception as e:
+            logging.error(f"Async storage error: {e}")
+            return "error"
+    else:
+        return "pending"
 ```
 
 ### Step 7.3: FIFO Storage Implementation
@@ -385,10 +478,13 @@ def __init__(self, ...):
         logging.warning("PINECONE_API_KEY not set - Pinecone disabled")
 ```
 
-#### 7.4.2: Pinecone Storage in Main Loop
+#### 7.4.2: Async Pinecone Storage in Main Loop
 ```python
 def run(self):
     # ... existing code ...
+    
+    # Track async operations
+    pending_operations = []
     
     try:
         while True:
@@ -396,18 +492,34 @@ def run(self):
             
             timestamp = time.time()
             
-            # Store in Pinecone with FIFO
-            pinecone_success = False
+            # Schedule async Pinecone storage (non-blocking)
+            storage_future = None
             if self.pinecone_manager:
-                pinecone_success = self.pinecone_manager.upsert_transcription(
+                storage_future = self.pinecone_manager.store_transcription_async(
                     text, speaker, timestamp
                 )
+                if storage_future:
+                    pending_operations.append((storage_future, timestamp, speaker, text[:30]))
             
-            # Log results
-            if pinecone_success:
-                logging.info(f"[{speaker}] {text[:60]}... → Pinecone:✓")
-            else:
-                logging.warning(f"[{speaker}] {text[:60]}... → Pinecone:✗")
+            # Check completed operations
+            completed_ops = []
+            for future, op_timestamp, op_speaker, op_text in pending_operations:
+                status = self.pinecone_manager.check_storage_status(future)
+                if status in ["success", "failed", "error", "skipped"]:
+                    completed_ops.append((future, op_timestamp, op_speaker, op_text, status))
+            
+            # Log completed operations and remove from pending
+            for future, op_timestamp, op_speaker, op_text, status in completed_ops:
+                if status == "success":
+                    logging.info(f"[{op_speaker}] {op_text}... → Pinecone:✓")
+                elif status == "failed":
+                    logging.warning(f"[{op_speaker}] {op_text}... → Pinecone:✗")
+                elif status == "error":
+                    logging.error(f"[{op_speaker}] {op_text}... → Pinecone:ERROR")
+                pending_operations.remove((future, op_timestamp, op_speaker, op_text))
+            
+            # Log current transcription (immediate feedback)
+            logging.info(f"[{speaker}] {text[:60]}... → Processing...")
             
             # ... rest of loop ...
 ```
@@ -525,7 +637,7 @@ environment:
 - **Batch Processing**: Process multiple transcriptions together
 
 ### 2. Pinecone Operations
-- **Async Operations**: Use async/await for non-blocking operations
+- **Async Operations**: Use ThreadPoolExecutor for non-blocking operations
 - **Connection Pooling**: Reuse Pinecone connections
 - **Retry Logic**: Implement exponential backoff for failures
 
@@ -535,9 +647,10 @@ environment:
 - **Garbage Collection**: Monitor and optimize memory usage
 
 ### 4. Latency Optimization
-- **Parallel Processing**: Run Senso.ai and Pinecone operations in parallel
-- **Non-blocking**: Don't block audio processing for storage operations
+- **Non-blocking Storage**: Don't block audio processing for Pinecone operations
+- **Background Threads**: Use thread pool for embedding generation and storage
 - **Timeout Management**: Set appropriate timeouts for API calls
+- **Operation Tracking**: Monitor pending operations without blocking main loop
 
 ## Monitoring & Observability
 
@@ -550,16 +663,21 @@ METRICS = {
     "fifo_eviction_count": "Number of records evicted per hour",
     "embedding_generation_time": "Time to generate embeddings",
     "index_size": "Current number of vectors in index",
-    "api_error_rate": "Pinecone API error rate"
+    "api_error_rate": "Pinecone API error rate",
+    "pending_operations_count": "Number of async operations in progress",
+    "async_completion_rate": "Rate of async operation completion",
+    "thread_pool_utilization": "Thread pool usage percentage"
 }
 ```
 
 ### 2. Logging Enhancements
 ```python
-# Enhanced logging for Pinecone operations
+# Enhanced logging for async Pinecone operations
 logging.info(f"Pinecone upsert: {vector_id} | Latency: {latency}ms | Success: {success}")
 logging.warning(f"FIFO eviction: Removed {oldest_id} | Index size: {current_size}")
 logging.error(f"Pinecone API error: {error_code} | Retry attempt: {attempt}")
+logging.debug(f"Async operation scheduled: {text[:30]}... | Pending: {pending_count}")
+logging.info(f"Async operation completed: {status} | Duration: {duration}ms")
 ```
 
 ### 3. Health Checks
