@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  audio-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: hey-listen-audio-worker
+
+    restart: unless-stopped
+
+    environment:
+      - SENSO_API_KEY=${SENSO_API_KEY}
+      - WHISPER_MODEL=${WHISPER_MODEL:-tiny}
+      - CHUNK_DURATION=${CHUNK_DURATION:-5}
+      - SAMPLE_RATE=${SAMPLE_RATE:-16000}
+
+    volumes:
+      - ./.env:/app/.env:ro
+
+    devices:
+      - /dev/snd:/dev/snd  # ALSA sound devices (Linux)
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
