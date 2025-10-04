@@ -23,6 +23,7 @@ RUN python -c "import whisper; whisper.load_model('tiny')"
 # Copy application code
 COPY src/audio_worker.py ./
 COPY src/config.py ./
+COPY src/pinecone_manager.py ./
 
 # Create non-root user for security
 RUN useradd -m -u 1000 audioworker && \
@@ -35,6 +36,12 @@ USER audioworker
 ENV WHISPER_MODEL=tiny
 ENV CHUNK_DURATION=5
 ENV SAMPLE_RATE=16000
+ENV PINECONE_API_KEY=""
+ENV PINECONE_ENVIRONMENT=""
+ENV PINECONE_INDEX_NAME="hey-listen-transcriptions"
+ENV EMBEDDING_MODEL="sentence-transformers/all-MiniLM-L6-v2"
+ENV VECTOR_DIMENSION="384"
+ENV MAX_RECORDS="1000"
 
 # Run the application
 CMD ["python", "audio_worker.py"]
